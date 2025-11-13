@@ -1,0 +1,22 @@
+{
+  "name": "momentum_bot",
+  "version": "1.0.0",
+  "description": "A Discord bot that uses Yahoo Finance data for momentum trading signals.",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": ["discord", "bot", "finance", "momentum", "yahoo-finance"],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "axios": "^1.6.8",
+    "chalk": "^5.3.0",
+    "discord.js": "^14.14.1",
+    "dotenv": "^16.4.5",
+    "node-fetch": "^3.3.2",
+    "yahoo-finance2": "^3.10.1"
+  }
+}
