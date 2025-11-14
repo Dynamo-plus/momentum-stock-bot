@@ -313,7 +313,7 @@ const fetcher = new StockDataFetcher();
 // ================= COMMAND REGISTRATION =================
 async function registerCommands() {
   const commands = [
-    new SlashCommandBuilder().setName("stock-help").setDescription("Show all available bot commands"),
+    new SlashCommandBuilder().setName("help").setDescription("Show all available bot commands"),
     new SlashCommandBuilder().setName("status").setDescription("Show scanner status"),
     new SlashCommandBuilder().setName("watchlist").setDescription("List watched tickers"),
     new SlashCommandBuilder().setName("scan-now").setDescription("Force manual scan"),
@@ -349,7 +349,7 @@ client.on("interactionCreate", async (interaction) => {
   const name = interaction.commandName;
 
   try {
-    if (name === "stock-help") {
+    if (name === "help") {
       const helpText = [
         "📘 **Available Commands**",
         "",
