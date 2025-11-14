@@ -119,8 +119,7 @@ class StockDataFetcher {
         const price = result.regularMarketPrice;
         const change_pct = result.regularMarketChangePercent ?? 0;
         const volume = result.regularMarketVolume ?? 0;
-        const avgVolume =
-          result.averageDailyVolume3Month || result.averageDailyVolume10Day || 1;
+        const avgVolume = result.averageDailyVolume3Month || result.averageDailyVolume10Day || 1;
         const rel_volume = avgVolume > 0 ? parseFloat((volume / avgVolume).toFixed(2)) : 1.0;
 
         return {
@@ -314,6 +313,7 @@ const fetcher = new StockDataFetcher();
 // ================= COMMAND REGISTRATION =================
 async function registerCommands() {
   const commands = [
+    new SlashCommandBuilder().setName("help").setDescription("Show all available bot commands"),
     new SlashCommandBuilder().setName("status").setDescription("Show scanner status"),
     new SlashCommandBuilder().setName("watchlist").setDescription("List watched tickers"),
     new SlashCommandBuilder().setName("scan-now").setDescription("Force manual scan"),
@@ -349,6 +349,22 @@ client.on("interactionCreate", async (interaction) => {
   const name = interaction.commandName;
 
   try {
+    if (name === "help") {
+      const helpText = [
+        "📘 **Available Commands**",
+        "",
+        "**/help** — Show all commands",
+        "**/status** — Show bot status & scan interval",
+        "**/watchlist** — View current ticker watchlist",
+        "**/add-ticker SYMBOL** — Add new ticker",
+        "**/remove-ticker SYMBOL** — Remove ticker",
+        "**/price SYMBOL** — Get real-time price for a ticker",
+        "**/scan-now** — Manually trigger a scan",
+      ].join("\n");
+
+      return interaction.reply({ content: helpText, ephemeral: true });
+    }
+    
     if (name === "status") {
       return interaction.reply({
         content: `📡 Bot is running.\nWatching **${WATCHLIST.length}** tickers.\nScan interval: ${SCAN_INTERVAL_MINUTES} minutes.`,
