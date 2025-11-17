@@ -1,12 +1,12 @@
-// ================= IMPORTS =================
+// macd-momentum-bot.js
 import YahooFinance from "yahoo-finance2";
 import {
   Client,
   GatewayIntentBits,
-  EmbedBuilder,
   REST,
   Routes,
   SlashCommandBuilder,
+  EmbedBuilder,
 } from "discord.js";
 import dotenv from "dotenv";
 import fs from "fs";
@@ -14,469 +14,551 @@ import chalk from "chalk";
 
 dotenv.config();
 
-const yahooFinance = new YahooFinance();
-
-// ================= CONFIG =================
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const DISCORD_CLIENT_ID = process.env.DISCORD_CLIENT_ID;
 const DISCORD_CHANNEL_ID = process.env.DISCORD_CHANNEL_ID;
+const POLL_INTERVAL_SEC = parseInt(process.env.POLL_INTERVAL_SEC || "60", 10);
 
-const SCAN_INTERVAL_MINUTES = 5;
-const BATCH_SIZE = 5;
-const DELAY_BETWEEN_STOCKS = 2000;
-const DELAY_BETWEEN_BATCHES = 10000;
+const yahooFinance = new YahooFinance();
 
-const MIN_VOLUME = 500000;
-const MIN_PRICE_CHANGE = 5.0;
-const MIN_REL_VOLUME = 1.3;
-const MAX_PRICE = 1000;
-const MIN_PRICE = 0.01;
-
+// Safety / tuning
+const MAX_ALERTS_PER_DAY = 20;
 const ALERT_COOLDOWN_MINUTES = 15;
-const MAX_ALERTS_PER_STOCK = 20;
+const HIST_INTERVAL = "1d"; // "1m" or "5m" — shorter = more near-real-time but more rate use
+const HIST_PERIOD_DAYS = 3; // how many days of bars to fetch (gives enough context for MACD)
+const MACD_FAST = 12;
+const MACD_SLOW = 26;
+const MACD_SIGNAL = 9;
 
-const WATCHLIST_FILE = "./watchlist.json";
+// ---- Real 40-per-minute Rate Limiter ----
+class RateLimiter {
+  constructor(maxPerMinute) {
+    this.maxPerMinute = maxPerMinute;
+    this.tokens = maxPerMinute;
+    this.refillRate = maxPerMinute / 60; // tokens per second
+    this.lastRefill = Date.now();
+  }
 
-// ================= WATCHLIST HANDLER =================
+  async consume() {
+    this._refill();
+
+    while (this.tokens < 1) {
+      await sleep(200); // wait & retry
+      this._refill();
+    }
+
+    this.tokens -= 1;
+  }
+
+  _refill() {
+    const now = Date.now();
+    const elapsedSec = (now - this.lastRefill) / 1000;
+    const refillAmount = elapsedSec * this.refillRate;
+
+    if (refillAmount > 0) {
+      this.tokens = Math.min(
+        this.maxPerMinute,
+        this.tokens + refillAmount
+      );
+      this.lastRefill = now;
+    }
+  }
+}
+
+const yahooLimiter = new RateLimiter(40)
+// === Load Allowed Tickers from CSV ===
+const CSV_TICKERS_FILE = "./tickers.csv";
+
+function loadTickersFromCSV() {
+  if (!fs.existsSync(CSV_TICKERS_FILE)) {
+    console.warn(chalk.yellow("tickers.csv not found — using fallback watchlist"));
+    return null;
+  }
+
+  try {
+    const raw = fs.readFileSync(CSV_TICKERS_FILE, "utf8");
+    return raw
+      .split(/\r?\n/)
+      .map((t) => t.trim().toUpperCase())
+      .filter((t) => t.length > 0);
+  } catch (err) {
+    console.error("Failed to read tickers.csv:", err);
+    return null;
+  }
+}
+
+// Load CSV tickers once at startup
+let CSV_TICKERS = [];
+try {
+  CSV_TICKERS = loadTickersFromCSV() || [];  
+  console.log(chalk.green(`Loaded ${CSV_TICKERS.length} CSV tickers.`));
+} catch (err) {
+  console.error(chalk.red(`Error loading CSV tickers: ${err.message}`));
+}
+
+
+// Watchlist persistence
+const WATCHLIST_FILE = "./macd-watchlist.json";
+
 function loadWatchlist() {
+
+  if (CSV_TICKERS && CSV_TICKERS.length > 0) {
+    console.log(chalk.green(`Loaded ${CSV_TICKERS.length} tickers from tickers.csv`));
+    return CSV_TICKERS;
+  }
+
+  // fallback to original JSON storage
   if (!fs.existsSync(WATCHLIST_FILE)) {
-    fs.writeFileSync(
-      WATCHLIST_FILE,
-      JSON.stringify(
-        ["AAPL", "TSLA", "NVDA", "AMD", "PLTR", "COIN", "RIVN", "SOFI", "OSCR", "VIVK"],
-        null,
-        2
-      )
-    );
+    fs.writeFileSync(WATCHLIST_FILE, JSON.stringify(["AAPL", "TSLA", "NVDA"], null, 2));
   }
   try {
     return JSON.parse(fs.readFileSync(WATCHLIST_FILE, "utf8"));
-  } catch (err) {
-    console.error("Failed to parse watchlist.json, resetting:", err);
-    const defaults = ["AAPL", "TSLA", "NVDA", "AMD", "PLTR"];
-    fs.writeFileSync(WATCHLIST_FILE, JSON.stringify(defaults, null, 2));
-    return defaults;
+  } catch (e) {
+    console.error("Failed reading watchlist:", e);
+    return ["AAPL", "TSLA", "NVDA"];
   }
 }
 
 function saveWatchlist(list) {
   fs.writeFileSync(WATCHLIST_FILE, JSON.stringify(list, null, 2));
 }
-
 let WATCHLIST = loadWatchlist();
 
-// ================= RATE LIMITER =================
-class RateLimiter {
-  constructor() {
-    this.lastRequest = null;
-    this.minDelay = 1000;
-    this.backoffDelay = 5000;
-    this.rateLimited = false;
-  }
+// Alert cooldowns / counters
+const lastAlertAt = new Map(); // ticker -> timestamp ms
+const dailyAlerts = new Map(); // ticker -> count
+let lastDailyReset = new Date().toDateString();
 
-  async wait() {
-    if (this.rateLimited) {
-      console.log(chalk.yellow(`   ⏳ Rate limited - waiting ${this.backoffDelay / 1000}s...`));
-      await new Promise((res) => setTimeout(res, this.backoffDelay));
-      this.rateLimited = false;
-    }
-    if (this.lastRequest) {
-      const elapsed = Date.now() - this.lastRequest;
-      if (elapsed < this.minDelay) {
-        await new Promise((res) => setTimeout(res, this.minDelay - elapsed));
-      }
-    }
-    this.lastRequest = Date.now();
-  }
-
-  markRateLimited() {
-    this.rateLimited = true;
-    this.backoffDelay = Math.min(this.backoffDelay * 1.5, 30000);
-  }
-
-  reset() {
-    this.backoffDelay = 5000;
+function resetDailyCounts() {
+  const today = new Date().toDateString();
+  if (today !== lastDailyReset) {
+    dailyAlerts.clear();
+    lastDailyReset = today;
+    console.log(chalk.blue("Daily alert counters reset"));
   }
 }
 
-// ================= STOCK FETCHER =================
-class StockDataFetcher {
-  constructor() {
-    this.rateLimiter = new RateLimiter();
+function canAlert(ticker) {
+  resetDailyCounts();
+  if ((dailyAlerts.get(ticker) || 0) >= MAX_ALERTS_PER_DAY) return false;
+  const last = lastAlertAt.get(ticker);
+  if (!last) return true;
+  const diffMinutes = (Date.now() - last) / 60000;
+  return diffMinutes >= ALERT_COOLDOWN_MINUTES;
+}
+function recordAlert(ticker) {
+  lastAlertAt.set(ticker, Date.now());
+  dailyAlerts.set(ticker, (dailyAlerts.get(ticker) || 0) + 1);
+}
+
+// ---------- Technical helpers ----------
+function sma(values, period) {
+  if (values.length < period) return null;
+  const slice = values.slice(values.length - period);
+  const s = slice.reduce((a, b) => a + b, 0);
+  return s / period;
+}
+function ema(values, period) {
+  // values: array of numbers (chronological oldest->newest)
+  if (values.length < period) return null;
+  const k = 2 / (period + 1);
+  // start with SMA of first period
+  let emaPrev = sma(values.slice(0, period), period);
+  // iterate from index = period to end
+  for (let i = period; i < values.length; i++) {
+    emaPrev = values[i] * k + emaPrev * (1 - k);
   }
-
-  // Returns object or null
-  async getStockData(ticker) {
-    for (let attempt = 1; attempt <= 2; attempt++) {
-      try {
-        await this.rateLimiter.wait();
-
-        const result = await yahooFinance.quote(ticker);
-        if (!result || typeof result.regularMarketPrice === "undefined") {
-          throw new Error("No valid data returned");
-        }
-
-        const price = result.regularMarketPrice;
-        const change_pct = result.regularMarketChangePercent ?? 0;
-        const volume = result.regularMarketVolume ?? 0;
-        const avgVolume = result.averageDailyVolume3Month || result.averageDailyVolume10Day || 1;
-        const rel_volume = avgVolume > 0 ? parseFloat((volume / avgVolume).toFixed(2)) : 1.0;
-
-        return {
-          ticker,
-          price,
-          change_pct,
-          volume,
-          rel_volume,
-          timestamp: new Date(),
-        };
-      } catch (err) {
-        console.error(chalk.red(`Error fetching ${ticker}: ${err.message}`));
-        // backoff on Yahoo rate limits
-        const msg = (err.message || "").toLowerCase();
-        if (msg.includes("rate") || msg.includes("429") || msg.includes("limit")) {
-          this.rateLimiter.markRateLimited();
-        }
-        if (attempt === 2) return null;
-        await new Promise((res) => setTimeout(res, 2000));
-      }
+  return emaPrev;
+}
+function emaSeries(values, period) {
+  // returns array of EMA values aligned with original values (null before enough pts)
+  const out = new Array(values.length).fill(null);
+  if (values.length < period) return out;
+  // initial SMA at index period-1
+  let prev = values.slice(0, period).reduce((a,b)=>a+b,0) / period;
+  out[period - 1] = prev;
+  const k = 2 / (period + 1);
+  for (let i = period; i < values.length; i++) {
+    prev = values[i] * k + prev * (1 - k);
+    out[i] = prev;
+  }
+  return out;
+}
+function macdSeries(closePrices) {
+  // returns { macd:[], signal:[], hist:[] } arrays aligned with closePrices
+  const fast = emaSeries(closePrices, MACD_FAST);
+  const slow = emaSeries(closePrices, MACD_SLOW);
+  const macd = new Array(closePrices.length).fill(null);
+  for (let i = 0; i < closePrices.length; i++) {
+    if (fast[i] != null && slow[i] != null) {
+      macd[i] = fast[i] - slow[i];
     }
-    return null;
+  }
+  // compute signal as EMA over macd values (skip nulls)
+  const macdVals = macd.map((v) => (v === null ? 0 : v)); // for emaSeries we need numbers, but we must align carefully
+  // We'll compute signal only for indices where macd has enough consecutive non-null values.
+  const signal = emaSeries(macdVals, MACD_SIGNAL).map((v, idx) => (macd[idx] === null ? null : v));
+  const hist = macd.map((v, i) => (v === null || signal[i] === null ? null : v - signal[i]));
+  return { macd, signal, hist };
+}
+
+// Simple divergence detection:
+// Compare last two local peaks/troughs in price vs macd: if price makes a higher high but macd makes lower high => bearish divergence.
+// We'll do a quick heuristic: find last two price highs (local maxima over window) and corresponding macd values.
+function findLocalExtrema(values, lookback = 10) {
+  // returns array of indices that are local highs (peak) or lows (trough) (very simple)
+  const highs = [];
+  const lows = [];
+  for (let i = lookback; i < values.length - lookback; i++) {
+    const center = values[i];
+    let isHigh = true;
+    let isLow = true;
+    for (let j = i - lookback; j <= i + lookback; j++) {
+      if (j === i) continue;
+      if (values[j] >= center) isHigh = false;
+      if (values[j] <= center) isLow = false;
+    }
+    if (isHigh) highs.push(i);
+    if (isLow) lows.push(i);
+  }
+  return { highs, lows };
+}
+
+function checkDivergence(closePrices, macdSeriesArr) {
+  // returns "bullish-div", "bearish-div", or null
+  const { highs, lows } = findLocalExtrema(closePrices, 6);
+  // bearish divergence: price makes higher high, macd makes lower high
+  if (highs.length >= 2) {
+    const i1 = highs[highs.length - 2];
+    const i2 = highs[highs.length - 1];
+    const priceHigherHigh = closePrices[i2] > closePrices[i1];
+    const macd = macdSeriesArr.macd;
+    if (macd[i1] != null && macd[i2] != null && priceHigherHigh && macd[i2] < macd[i1]) {
+      return "bearish-div";
+    }
+  }
+  // bullish divergence: price makes lower low, macd makes higher low
+  if (lows.length >= 2) {
+    const i1 = lows[lows.length - 2];
+    const i2 = lows[lows.length - 1];
+    const priceLowerLow = closePrices[i2] < closePrices[i1];
+    const macd = macdSeriesArr.macd;
+    if (macd[i1] != null && macd[i2] != null && priceLowerLow && macd[i2] > macd[i1]) {
+      return "bullish-div";
+    }
+  }
+  return null;
+}
+
+// ---------- Fetcher ----------
+async function sleep(ms) {
+  return new Promise((res) => setTimeout(res, ms));
+}
+class Fetcher {
+  constructor() {
+    this.lastRequest = 0;
   }
 
-  // Quick single-ticker price fetch for /price command
-  async fetchPrice(ticker) {
+  // Fetch intraday bars using yahoo-finance2, returns sorted oldest->newest closes array
+  async fetchCloseSeries(ticker) {
+    await yahooLimiter.consume();   // ONLY rate limit used now
+
     try {
-      const result = await yahooFinance.quote(ticker);
-      if (!result || typeof result.regularMarketPrice === "undefined") return null;
-      return result;
+      const now = new Date();
+      const period1 = '2025-01-01';
+      const period2 = now.toISOString().split('T')[0];
+
+      const result = await yahooFinance.historical(ticker, {
+        period1,
+        period2,
+        interval: HIST_INTERVAL
+      });
+
+      if (!result || !Array.isArray(result) || result.length === 0) return null;
+
+      const sorted = result.sort((a, b) => new Date(a.date) - new Date(b.date));
+      const closes = sorted.map(r => r.close);
+
+      return { closes, raw: sorted };
     } catch (err) {
-      console.error(`fetchPrice error for ${ticker}:`, err.message);
+      console.error(chalk.red(`fetchCloseSeries error ${ticker}: ${err.message}`));
       return null;
     }
   }
+
 }
 
-// ================= MOMENTUM SCANNER =================
-class MomentumScanner {
+// ---------- Analyzer ----------
+class MACDAnalyzer {
   constructor() {
-    this.fetcher = new StockDataFetcher();
-    this.alertHistory = new Map();
-    this.alertCounter = new Map();
-    this.lastReset = new Date().toDateString();
+    this.fetcher = new Fetcher();
+    // Keep last known macd/signal to detect cross events reliably
+    this.lastState = new Map(); // ticker -> { macdLast, signalLast }
   }
 
-  resetDailyCounters() {
-    const today = new Date().toDateString();
-    if (today !== this.lastReset) {
-      this.alertCounter.clear();
-      this.lastReset = today;
-      console.log(chalk.blue("📅 Daily counters reset"));
+  async analyzeTicker(ticker) {
+    const data = await this.fetcher.fetchCloseSeries(ticker);
+    if (!data) return null;
+    const { closes, raw } = data;
+    if (!closes || closes.length < MACD_SLOW + MACD_SIGNAL + 2) {
+      // Not enough bars for stable MACD
+      return null;
     }
-  }
+    const macdObj = macdSeries(closes); // macd, signal, hist aligned
+    // find latest non-null index
+    let idx = macdObj.macd.length - 1;
+    while (idx >= 0 && (macdObj.macd[idx] === null || macdObj.signal[idx] === null)) idx--;
+    if (idx < 1) return null;
 
-  canSendAlert(ticker) {
-    this.resetDailyCounters();
-    if ((this.alertCounter.get(ticker) || 0) >= MAX_ALERTS_PER_STOCK) return false;
-    if (this.alertHistory.has(ticker)) {
-      const last = this.alertHistory.get(ticker);
-      const diff = (Date.now() - last) / 60000;
-      if (diff < ALERT_COOLDOWN_MINUTES) return false;
+    const macdNow = macdObj.macd[idx];
+    const signalNow = macdObj.signal[idx];
+    const macdPrev = macdObj.macd[idx - 1];
+    const signalPrev = macdObj.signal[idx - 1];
+
+    // Detect cross
+    let cross = null;
+    // prev: macdPrev < signalPrev  and now macdNow > signalNow => bullish cross
+    if (
+      macdPrev != null &&
+      signalPrev != null &&
+      macdNow != null &&
+      signalNow != null
+    ) {
+        if (macdPrev < signalPrev && macdNow > signalNow) cross = "bullish-cross";
+        if (macdPrev > signalPrev && macdNow < signalNow) cross = "bearish-cross";
     }
-    return true;
-  }
 
-  recordAlert(ticker) {
-    this.alertHistory.set(ticker, Date.now());
-    this.alertCounter.set(ticker, (this.alertCounter.get(ticker) || 0) + 1);
-  }
+    // divergence
+    const divergence = checkDivergence(closes, macdObj); // "bullish-div" | "bearish-div" | null
 
-  getAlertNumber(ticker) {
-    return (this.alertCounter.get(ticker) || 0) + 1;
-  }
+    // Basic strength filter: require histogram increase in direction
+    const histNow = macdObj.hist[idx];
+    const histPrev = macdObj.hist[idx - 1];
 
-  checkMomentum(data) {
-    if (!data) return [false, "No data"];
-    if (data.price > MAX_PRICE) return [false, "Price too high"];
-    if (data.price < MIN_PRICE) return [false, "Price too low"];
-    if (data.volume < MIN_VOLUME) return [false, "Volume too low"];
-    if (Math.abs(data.change_pct) < MIN_PRICE_CHANGE) return [false, "Move too small"];
-    if (data.rel_volume < MIN_REL_VOLUME) return [false, "RelVol too low"];
-    return [true, "Momentum detected!"];
-  }
+    // Price info (latest bar)
+    const latestBar = raw[idx];
+    const prevBar = raw[idx - 1];
 
-  formatDiscordEmbed(data) {
-    const alertNum = this.getAlertNumber(data.ticker);
-    const color = data.change_pct > 0 ? 0x00ff00 : 0xff0000;
-    const emoji = data.change_pct > 0 ? "🟢" : "🔴";
-    const time = data.timestamp.toLocaleTimeString();
-
-    return new EmbedBuilder()
-      .setTitle(`${emoji} ${data.ticker} | Alert #${alertNum}`)
-      .setDescription(`**$${data.price}** | ${data.change_pct > 0 ? "+" : ""}${data.change_pct}%`)
-      .setColor(color)
-      .addFields(
-        {
-          name: "📊 Volume",
-          value: `${data.volume.toLocaleString()}\n${data.rel_volume}x RelVol`,
-          inline: true,
-        },
-        {
-          name: "⏱ Time",
-          value: `${time}`,
-          inline: true,
-        }
-      )
-      .setTimestamp();
+    return {
+      ticker,
+      cross,
+      divergence,
+      macdNow,
+      signalNow,
+      histNow,
+      histPrev,
+      price: latestBar.close,
+      prevPrice: prevBar.close,
+      timestamp: latestBar.date,
+      raw,
+      idx,
+    };
   }
 }
 
-// ================= MAIN BOT =================
-class MomentumBot {
-  constructor(client) {
-    this.client = client;
-    this.scanner = new MomentumScanner();
-    this.scanCount = 0;
-  }
+// ---------- Discord bot wiring ----------
+const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+const analyzer = new MACDAnalyzer();
 
-  async scanBatch(batch, channel) {
-    console.log(chalk.magenta(`🔍 Scanning batch: ${batch.join(", ")}`));
-    for (const ticker of batch) {
-      console.log(chalk.cyan(`   ▶️ Fetching ${ticker}...`));
-      const data = await this.scanner.fetcher.getStockData(ticker);
-      if (!data) {
-        console.log(chalk.yellow(`   ⚠️ No data for ${ticker}`));
-        await new Promise((r) => setTimeout(r, DELAY_BETWEEN_STOCKS));
-        continue;
-      }
-
-      const [isMomentum, reason] = this.scanner.checkMomentum(data);
-      if (isMomentum && this.scanner.canSendAlert(ticker)) {
-        const embed = this.scanner.formatDiscordEmbed(data);
-        try {
-          await channel.send({ embeds: [embed] });
-          this.scanner.recordAlert(ticker);
-          console.log(chalk.green(`   🚨 ALERT SENT for ${ticker} (${reason})`));
-        } catch (err) {
-          console.error("Failed to send alert to channel:", err.message);
-        }
-      } else {
-        console.log(chalk.gray(`   ❌ No alert for ${ticker} (${reason})`));
-      }
-
-      await new Promise((res) => setTimeout(res, DELAY_BETWEEN_STOCKS));
-    }
-  }
-
-  async scanAndPost(channel) {
-    this.scanCount++;
-    console.log(chalk.blueBright(`\n📦 Starting scan #${this.scanCount} at ${new Date().toLocaleTimeString()}`));
-
-    for (let i = 0; i < WATCHLIST.length; i += BATCH_SIZE) {
-      const batch = WATCHLIST.slice(i, i + BATCH_SIZE);
-      await this.scanBatch(batch, channel);
-      if (i + BATCH_SIZE < WATCHLIST.length) {
-        console.log(chalk.gray(`   ⏸ Waiting ${DELAY_BETWEEN_BATCHES / 1000}s before next batch...`));
-        await new Promise((res) => setTimeout(res, DELAY_BETWEEN_BATCHES));
-      }
-    }
-
-    console.log(chalk.greenBright(`🏁 Scan #${this.scanCount} complete at ${new Date().toLocaleTimeString()}`));
-  }
-
-  // Start periodic scanning (non-blocking)
-  start() {
-    // run once immediately
-    this.client.channels.fetch(DISCORD_CHANNEL_ID)
-      .then((channel) => this.scanAndPost(channel))
-      .catch((e) => console.error("Failed to fetch channel for initial scan:", e.message));
-
-    // schedule repeating scans
-    setInterval(async () => {
-      try {
-        const channel = await this.client.channels.fetch(DISCORD_CHANNEL_ID);
-        await this.scanAndPost(channel);
-      } catch (e) {
-        console.error("Scanner periodic error:", e.message);
-      }
-    }, SCAN_INTERVAL_MINUTES * 60000);
-  }
-}
-
-// ================= DISCORD CLIENT =================
-const client = new Client({
-  intents: [GatewayIntentBits.Guilds],
-});
-
-const fetcher = new StockDataFetcher();
-
-// ================= COMMAND REGISTRATION =================
 async function registerCommands() {
   const commands = [
-    new SlashCommandBuilder().setName("help").setDescription("Show all available bot commands"),
-    new SlashCommandBuilder().setName("status").setDescription("Show scanner status"),
-    new SlashCommandBuilder().setName("watchlist").setDescription("List watched tickers"),
-    new SlashCommandBuilder().setName("scan-now").setDescription("Force manual scan"),
+    new SlashCommandBuilder().setName("help").setDescription("Show available commands"),
+    new SlashCommandBuilder().setName("status").setDescription("Show bot status"),
+    new SlashCommandBuilder().setName("watchlist").setDescription("Show monitored tickers"),
     new SlashCommandBuilder()
       .setName("add-ticker")
-      .setDescription("Add a ticker to the watchlist")
-      .addStringOption((opt) =>
-        opt.setName("symbol").setDescription("Ticker symbol (e.g. AAPL)").setRequired(true)
-      ),
+      .setDescription("Add ticker to monitor")
+      .addStringOption((o) => o.setName("symbol").setDescription("Ticker").setRequired(true)),
     new SlashCommandBuilder()
       .setName("remove-ticker")
-      .setDescription("Remove a ticker from the watchlist")
-      .addStringOption((opt) =>
-        opt.setName("symbol").setDescription("Ticker symbol (e.g. TSLA)").setRequired(true)
-      ),
-    new SlashCommandBuilder()
-      .setName("price")
-      .setDescription("Get current price for a ticker")
-      .addStringOption((opt) =>
-        opt.setName("symbol").setDescription("Ticker symbol (e.g. NVDA)").setRequired(true)
-      ),
+      .setDescription("Remove ticker")
+      .addStringOption((o) => o.setName("symbol").setDescription("Ticker").setRequired(true)),
+    new SlashCommandBuilder().setName("scan-now").setDescription("Run immediate scan"),
   ].map((c) => c.toJSON());
 
   const rest = new REST({ version: "10" }).setToken(DISCORD_TOKEN);
   await rest.put(Routes.applicationCommands(DISCORD_CLIENT_ID), { body: commands });
-  console.log(chalk.green("✅ Slash commands registered"));
+  console.log(chalk.green("Slash commands registered"));
 }
 
-// ================= INTERACTION HANDLER =================
+function formatEmbedForAlert(res, type) {
+  const color = type === "bullish" ? 0x00ff00 : 0xff0000;
+  const emoji = type === "bullish" ? "🟢 Bullish MACD" : "🔴 Bearish MACD";
+  const divText = res.divergence ? ` • Divergence: ${res.divergence}` : "";
+  const timeStr = new Date(res.timestamp).toLocaleString();
+  return new EmbedBuilder()
+    .setTitle(`${emoji} ${res.ticker}`)
+    .setDescription(`Price: $${res.price} • Cross: ${res.cross}${divText}`)
+    .addFields(
+      { name: "MACD", value: `${res.macdNow.toFixed(6)}`, inline: true },
+      { name: "Signal", value: `${res.signalNow.toFixed(6)}`, inline: true },
+      { name: "Histogram", value: `${res.histNow != null ? res.histNow.toFixed(6) : "N/A"}`, inline: true },
+      { name: "Time", value: `${timeStr}`, inline: true }
+    )
+    .setColor(color)
+    .setTimestamp();
+}
+
+// scanning loop
+let scanning = false;
+async function runScanOnce(channel, tickers = WATCHLIST) {
+  console.log(chalk.magenta(`Starting MACD scan for ${tickers.length} tickers at ${new Date().toLocaleTimeString()}`));
+  for (const sym of tickers) {
+    try {
+      const res = await analyzer.analyzeTicker(sym);
+      if (!res) {
+        console.log(chalk.gray(`No MACD data for ${sym}`));
+        continue;
+      }
+      if (!res.cross) {
+        // we only alert on cross events; if divergence alone and no cross you could choose to alert, optional.
+        console.log(chalk.gray(`${sym}: no cross (div: ${res.divergence || "none"})`));
+        continue;
+      }
+      const tickerOk = canAlert(sym);
+      if (!tickerOk) {
+        console.log(chalk.yellow(`Skipped ${sym} due to cooldown or daily limit`));
+        continue;
+      }
+      // Additional filter: confirm histogram moved in same direction
+      // bullish-cross: histNow > histPrev (gaining positive momentum)
+      let pass = true;
+      if (res.cross !== "bullish-cross") {
+          console.log(chalk.gray(`${sym}: ignoring bearish signals — bullish-only mode`));
+          continue;
+      }
+
+      // histogram rising
+      if (!(res.histNow > res.histPrev)) {
+          console.log(chalk.gray(`${sym}: MACD bullish but histogram not rising -> skip`));
+          continue;
+      }
+
+      // PRICE rising confirmation
+      if (!(res.price > res.prevPrice)) {
+          console.log(chalk.gray(`${sym}: MACD bullish but price not rising -> skip`));
+          continue;
+      }
+
+      if (!pass) {
+        console.log(chalk.gray(`${sym}: cross detected but histogram not confirming -> no alert`));
+        continue;
+      }
+      const type = res.cross === "bullish-cross" ? "bullish" : "bearish";
+      const embed = formatEmbedForAlert(res, type);
+      try {
+        await channel.send({ embeds: [embed] });
+        recordAlert(sym);
+        console.log(chalk.green(`Alert sent for ${sym} (${res.cross}${res.divergence ? " + " + res.divergence : ""})`));
+      } catch (err) {
+        console.error(chalk.red(`Failed to send message for ${sym}: ${err.message}`));
+      }
+    } catch (err) {
+      console.error(chalk.red(`Error analyzing ${sym}: ${err.message}`));
+    }
+  }
+  console.log(chalk.green("Scan finished"));
+}
+
+// orchestrator: periodic scanning
+let loopHandle = null;
+async function startLoop(client) {
+  if (scanning) return;
+  scanning = true;
+  const channel = await client.channels.fetch(DISCORD_CHANNEL_ID);
+  // run immediately once
+  runScanOnce(channel).catch((e) => console.error("Initial scan error:", e));
+  loopHandle = setInterval(() => {
+    runScanOnce(channel).catch((e) => console.error("Periodic scan error:", e));
+  }, POLL_INTERVAL_SEC * 1000);
+  console.log(chalk.blue(`Started periodic scanning every ${POLL_INTERVAL_SEC}s`));
+}
+function stopLoop() {
+  if (loopHandle) clearInterval(loopHandle);
+  scanning = false;
+}
+
+// ---------- Interaction handler ----------
 client.on("interactionCreate", async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
-
   const name = interaction.commandName;
-
   try {
     if (name === "help") {
-      const helpText = [
-        "📘 **Available Commands**",
-        "",
-        "**/help** — Show all commands",
-        "**/status** — Show bot status & scan interval",
-        "**/watchlist** — View current ticker watchlist",
-        "**/add-ticker SYMBOL** — Add new ticker",
-        "**/remove-ticker SYMBOL** — Remove ticker",
-        "**/price SYMBOL** — Get real-time price for a ticker",
-        "**/scan-now** — Manually trigger a scan",
-      ].join("\n");
-
-      return interaction.reply({ content: helpText, ephemeral: true });
+      return interaction.reply({
+        content:
+          "/help, /status, /watchlist, /add-ticker SYMBOL, /remove-ticker SYMBOL, /scan-now\n\nNote: Use tickers like AAPL, TSLA, NVDA.",
+        ephemeral: true,
+      });
     }
-
     if (name === "status") {
       return interaction.reply({
-        content: `📡 Bot is running.\nWatching **${WATCHLIST.length}** tickers.\nScan interval: ${SCAN_INTERVAL_MINUTES} minutes.`,
+        content: `Monitoring **${WATCHLIST.length}** tickers. Poll interval: ${POLL_INTERVAL_SEC}s.\nScanning: ${scanning}`,
         ephemeral: true,
       });
     }
-
     if (name === "watchlist") {
-      return interaction.reply({
-        content: `📋 **Watchlist:**\n${WATCHLIST.join(", ")}`,
-        ephemeral: true,
-      });
-    }
-
-    if (name === "scan-now") {
-      // Reply immediately then run the scan in the background
-      await interaction.reply({ content: "⚙️ Manual scan started...", ephemeral: true });
-      const channel = await client.channels.fetch(DISCORD_CHANNEL_ID);
-      const bot = new MomentumBot(client);
-      bot.scanAndPost(channel).catch((e) => {
-        console.error("Manual scan error:", e.message);
-        // attempt to notify user if possible
-        try {
-          interaction.followUp({ content: `❌ Manual scan failed: ${e.message}`, ephemeral: true });
-        } catch (e) {}
-      });
-      return;
+      return interaction.reply({ content: `Watchlist:\n${WATCHLIST.join(", ")}`, ephemeral: true });
     }
 
     if (name === "add-ticker") {
-      const raw = interaction.options.getString("symbol");
-      const symbol = raw.trim().toUpperCase();
-      if (!/^[A-Z0-9\.\-]{1,8}$/.test(symbol)) {
-        return interaction.reply({ content: "⚠️ Invalid ticker format.", ephemeral: true });
-      }
-      if (WATCHLIST.includes(symbol)) {
-        return interaction.reply({ content: `⚠️ ${symbol} is already in the watchlist.`, ephemeral: true });
+      await interaction.deferReply({ ephemeral: true });
+
+      const symbol = interaction.options.getString("symbol").trim().toUpperCase();
+
+      // Validate against CSV list
+      if (CSV_TICKERS.length > 0 && !CSV_TICKERS.includes(symbol)) {
+        return interaction.editReply(
+          `❌ ${symbol} is not in tickers.csv.\nUpdate tickers.csv if you want to allow this ticker.`
+        );
       }
 
-      // Validate symbol exists by fetching quick price
-      await interaction.deferReply({ ephemeral: true }); // allow more time
-      const info = await fetcher.fetchPrice(symbol);
-      if (!info) {
-        return interaction.editReply({ content: `❌ Could not find data for ${symbol}. Not added.` });
+      if (WATCHLIST.includes(symbol)) {
+        return interaction.editReply(`Already watching ${symbol}.`);
+      }
+
+      // Validate ticker by fetching data
+      const test = await analyzer.fetcher.fetchCloseSeries(symbol);
+      if (!test || !test.closes || test.closes.length === 0) {
+        return interaction.editReply(`❌ Could not fetch data for ${symbol}. Not added.`);
       }
 
       WATCHLIST.push(symbol);
       saveWatchlist(WATCHLIST);
-      console.log(chalk.green(`Added ${symbol} to watchlist`));
-      return interaction.editReply({ content: `✅ Added ${symbol} to the watchlist.` });
+
+      return interaction.editReply(`✅ Added ${symbol} to watchlist.`);
     }
 
     if (name === "remove-ticker") {
-      const raw = interaction.options.getString("symbol");
-      const symbol = raw.trim().toUpperCase();
-      if (!WATCHLIST.includes(symbol)) {
-        return interaction.reply({ content: `⚠️ ${symbol} is not in the watchlist.`, ephemeral: true });
-      }
+      const symbol = interaction.options.getString("symbol").trim().toUpperCase();
+      if (!WATCHLIST.includes(symbol)) return interaction.reply({ content: `${symbol} not in watchlist.`, ephemeral: true });
       WATCHLIST = WATCHLIST.filter((s) => s !== symbol);
       saveWatchlist(WATCHLIST);
-      console.log(chalk.yellow(`Removed ${symbol} from watchlist`));
-      return interaction.reply({ content: `🗑️ Removed ${symbol} from the watchlist.`, ephemeral: true });
+      return interaction.reply({ content: `Removed ${symbol}`, ephemeral: true });
     }
 
-    if (name === "price") {
-      const raw = interaction.options.getString("symbol");
-      const symbol = raw.trim().toUpperCase();
-
-      await interaction.deferReply({ ephemeral: true }); // allow extra time for fetch
-      const info = await fetcher.fetchPrice(symbol);
-      if (!info) {
-        return interaction.editReply({ content: `❌ Could not fetch price for ${symbol}.` });
-      }
-
-      const price = info.regularMarketPrice ?? "N/A";
-      const change = info.regularMarketChange ?? 0;
-      const changePct = info.regularMarketChangePercent ?? 0;
-      const pre = info.preMarketPrice;
-      const post = info.postMarketPrice;
-      const vol = info.regularMarketVolume ?? 0;
-
-      const embed = new EmbedBuilder()
-        .setTitle(`${info.shortName ?? info.symbol} — ${info.symbol}`)
-        .setDescription(`**$${price}**  |  ${change >= 0 ? "+" : ""}${change.toFixed(2)} (${changePct >= 0 ? "+" : ""}${(changePct * 1).toFixed(2)}%)`)
-        .addFields(
-          { name: "Volume", value: `${vol.toLocaleString()}`, inline: true },
-          { name: "Day Range", value: `${info.regularMarketDayLow ?? "N/A"} - ${info.regularMarketDayHigh ?? "N/A"}`, inline: true }
-        )
-        .setTimestamp();
-
-      return interaction.editReply({ embeds: [embed] });
+    if (name === "scan-now") {
+      await interaction.reply({ content: "Manual scan started...", ephemeral: true });
+      const channel = await client.channels.fetch(DISCORD_CHANNEL_ID);
+      await runScanOnce(channel, WATCHLIST);
     }
+
   } catch (err) {
-    console.error("Interaction handler error:", err);
+    console.error("Interaction error:", err);
     try {
       if (interaction.deferred || interaction.replied) {
-        await interaction.followUp({ content: `❌ Error: ${err.message}`, ephemeral: true });
+        interaction.followUp({ content: `Error: ${err.message}`, ephemeral: true });
       } else {
-        await interaction.reply({ content: `❌ Error: ${err.message}`, ephemeral: true });
+        interaction.reply({ content: `Error: ${err.message}`, ephemeral: true });
       }
-    } catch (e) {
-      console.error("Failed to notify user of error:", e.message);
-    }
+    } catch (e) {}
   }
 });
 
-// ================= START BOT =================
+// ---------- startup ----------
 client.once("ready", async () => {
-  console.log(chalk.greenBright(`✅ Logged in as ${client.user.tag}`));
+  console.log(chalk.greenBright(`Logged in as ${client.user.tag}`));
   await registerCommands();
-  const bot = new MomentumBot(client);
-  bot.start();
+  startLoop(client).catch((e) => console.error("Start loop error:", e));
 });
 
 client.login(DISCORD_TOKEN);
